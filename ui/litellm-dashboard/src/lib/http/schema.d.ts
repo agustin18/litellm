@@ -1263,12 +1263,12 @@ export interface paths {
          * @description Benchmarks for the auto-router dashboard: session shape, savings against the configured
          *     baseline, and prompt-caching behaviour bucketed by what the router did.
          *
-         *     Reads session rollups folded once per request at spend-write time, so this endpoint
-         *     never scans LiteLLM_SpendLogs. A user filter selects only turns attributed to that
-         *     internal user when written; older key-only history remains outside user views. A session
-         *     is in the window when it overlaps it: its last turn is on or after start_date and its first turn is on or before
-         *     end_date. Overall hit rate is over telemetry-bearing turns; each bucket's hit rate is
-         *     over that bucket's turns.
+         *     Total savings use the same request-date daily aggregation as Overall cost optimization,
+         *     including recorded history and requests without session IDs. Daily rows cannot separate
+         *     auto-router actual spend or classifier cost, so those totals and their derived metrics
+         *     are unavailable. Session statistics and per-router groups cover whole sessions that
+         *     overlap the window. A user filter uses the user recorded when each row was written.
+         *     Overall hit rate is over telemetry-bearing turns; each bucket's hit rate is over its turns.
          *
          *     The rollup supplies the measures, never the list. Which routers appear comes from the
          *     model registry, so one shows up as soon as it is configured and reads zero until it
@@ -24180,7 +24180,7 @@ export interface components {
         };
         /**
          * AutoRouterBenchmarkGroup
-         * @description One auto-router's slice of the benchmarks.
+         * @description One auto-router's whole overlapping sessions, separate from request-date daily totals.
          */
         AutoRouterBenchmarkGroup: {
             /** Avg Session Seconds */
@@ -24191,13 +24191,13 @@ export interface components {
             avg_turns_per_session: number;
             /**
              * Baseline Spend
-             * @description Estimated single-model cost for covered turns only
+             * @description Actual spend plus recorded savings; unavailable for daily totals without matching actual cost
              */
             baseline_spend: number | null;
             cache: components["schemas"]["AutoRouterCacheStats"];
             /**
              * Classifier Cost
-             * @description Recorded LLM classifier cost already included in spend; null when any session turns predate subtotal recording, and zero for an empty window
+             * @description Recorded classifier cost included in spend; unavailable in daily totals. Session groups require every turn to record the subtotal. Zero for an entirely empty window
              */
             classifier_cost: number | null;
             /**
@@ -24212,36 +24212,36 @@ export interface components {
             router_type: string;
             /**
              * Saved Pct
-             * @description Covered savings over covered baseline spend, as a percentage
+             * @description Recorded savings over actual spend plus recorded savings; unavailable for daily totals without matching actual cost
              */
             saved_pct: number | null;
             /**
              * Saved Per Session
-             * @description Average session savings; unavailable unless every turn is covered
+             * @description Recorded savings in whole overlapping sessions divided by their session count, independent of request-date daily savings totals
              */
             saved_per_session: number | null;
             /**
              * Saved Spend
-             * @description Signed savings for covered turns only; null when traffic has no current estimates
+             * @description Signed recorded savings, including historical and current estimates once. Totals use the same request-date daily source as Overall cost optimization, including requests without sessions. Per-router groups cover whole overlapping sessions. Turns without an estimate add no savings
              */
             saved_spend: number | null;
             /**
              * Savings Estimated Actual Spend
-             * @description Actual spend, including classifier cost, for covered turns only
+             * @description Actual spend, including classifier cost, for covered tracked-session turns only
              */
             savings_estimated_actual_spend: number;
             /**
              * Savings Estimated Turns
-             * @description Turns covered by the current savings estimator; legacy estimates are excluded
+             * @description Tracked session turns covered by the current savings estimator; legacy estimates are excluded from this coverage count, not from recorded savings
              */
             savings_estimated_turns: number;
             /** Sessions */
             sessions: number;
             /**
              * Spend
-             * @description What the routed traffic actually cost
+             * @description Actual auto-router cost; unavailable in daily totals because daily rows mix router and other traffic. Per-router groups report tracked session spend. Zero for an entirely empty window
              */
-            spend: number;
+            spend: number | null;
             /**
              * Tier Turns
              * @description Turns per tier, keyed by the tier name the routing decision recorded at request time (never re-derived at read time, since the tier-to-model mapping is mutable config). Tier names are scoped to this group's router_type and are not comparable across types: a complexity router reports 'SIMPLE'/'MEDIUM'/'COMPLEX'/'REASONING', a quality router reports its numeric quality tier, and an adaptive router records no tier at all. Turns no tier served (the classifier fell back to default_model) are absent rather than pooled under a sentinel key, so the values may sum to less than turns
@@ -24254,7 +24254,7 @@ export interface components {
         };
         /**
          * AutoRouterBenchmarkTotals
-         * @description Session-shape and savings aggregates over auto-routed traffic in the window.
+         * @description Request-date savings totals with statistics for whole sessions overlapping the window.
          */
         AutoRouterBenchmarkTotals: {
             /** Avg Session Seconds */
@@ -24265,53 +24265,53 @@ export interface components {
             avg_turns_per_session: number;
             /**
              * Baseline Spend
-             * @description Estimated single-model cost for covered turns only
+             * @description Actual spend plus recorded savings; unavailable for daily totals without matching actual cost
              */
             baseline_spend: number | null;
             cache: components["schemas"]["AutoRouterCacheStats"];
             /**
              * Classifier Cost
-             * @description Recorded LLM classifier cost already included in spend; null when any session turns predate subtotal recording, and zero for an empty window
+             * @description Recorded classifier cost included in spend; unavailable in daily totals. Session groups require every turn to record the subtotal. Zero for an entirely empty window
              */
             classifier_cost: number | null;
             /**
              * Saved Pct
-             * @description Covered savings over covered baseline spend, as a percentage
+             * @description Recorded savings over actual spend plus recorded savings; unavailable for daily totals without matching actual cost
              */
             saved_pct: number | null;
             /**
              * Saved Per Session
-             * @description Average session savings; unavailable unless every turn is covered
+             * @description Recorded savings in whole overlapping sessions divided by their session count, independent of request-date daily savings totals
              */
             saved_per_session: number | null;
             /**
              * Saved Spend
-             * @description Signed savings for covered turns only; null when traffic has no current estimates
+             * @description Signed recorded savings, including historical and current estimates once. Totals use the same request-date daily source as Overall cost optimization, including requests without sessions. Per-router groups cover whole overlapping sessions. Turns without an estimate add no savings
              */
             saved_spend: number | null;
             /**
              * Savings Estimated Actual Spend
-             * @description Actual spend, including classifier cost, for covered turns only
+             * @description Actual spend, including classifier cost, for covered tracked-session turns only
              */
             savings_estimated_actual_spend: number;
             /**
              * Savings Estimated Turns
-             * @description Turns covered by the current savings estimator; legacy estimates are excluded
+             * @description Tracked session turns covered by the current savings estimator; legacy estimates are excluded from this coverage count, not from recorded savings
              */
             savings_estimated_turns: number;
             /** Sessions */
             sessions: number;
             /**
              * Spend
-             * @description What the routed traffic actually cost
+             * @description Actual auto-router cost; unavailable in daily totals because daily rows mix router and other traffic. Per-router groups report tracked session spend. Zero for an entirely empty window
              */
-            spend: number;
+            spend: number | null;
             /** Turns */
             turns: number;
         };
         /**
          * AutoRouterBenchmarksResponse
-         * @description Benchmarks for the auto-router dashboard, aggregated from the per-session rollup.
+         * @description Daily recorded savings with tracked-session breakdowns for the auto-router dashboard.
          */
         AutoRouterBenchmarksResponse: {
             /**
@@ -24573,19 +24573,19 @@ export interface components {
         AutoRouterSessionResponse: {
             /**
              * Baseline Model
-             * @description The savings baseline most covered turns were priced against, recorded turn by turn, so it still names the counterfactual after the router is reconfigured or removed. None when no turn recorded one: rows from before the baseline was recorded, and adaptive and quality routers, which derive no baseline and so report no savings
+             * @description The savings baseline recorded by most session turns, including historical turns, recorded turn by turn, so it still names the counterfactual after the router is reconfigured or removed. None when no turn recorded one: rows from before the baseline was recorded, and adaptive and quality routers, which derive no baseline and so report no savings
              */
             baseline_model: string | null;
             /**
              * Baseline Models
-             * @description Covered turns priced against each baseline model; more than one entry means the router's baseline changed mid-session and baseline_spend mixes both
+             * @description Session turns recording each baseline model, including historical turns; more than one entry means the router's baseline changed mid-session. These counts do not imply savings-estimate coverage
              */
             baseline_models: {
                 [key: string]: number;
             };
             /**
              * Baseline Spend
-             * @description Estimated single-model cost; unavailable unless every turn is covered
+             * @description Actual session spend plus recorded savings; turns without an estimate add no savings
              */
             baseline_spend: number | null;
             /**
@@ -24605,7 +24605,7 @@ export interface components {
             router_type: string;
             /**
              * Saved Spend
-             * @description Estimated savings for covered turns only, net of classifier cost
+             * @description Recorded signed savings, retaining historical estimates and adding current estimates once
              */
             saved_spend: number | null;
             /**
