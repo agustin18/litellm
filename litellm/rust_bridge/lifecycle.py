@@ -2,11 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Awaitable, Iterator
 from dataclasses import dataclass
-from types import MappingProxyType
 from typing import Final, Protocol
-
-from litellm.litellm_core_utils.execution import ExecutionOrigin
-from litellm.rust_bridge.response_metadata import execution_metadata, mark_execution_error
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,7 +80,6 @@ class Stream(AsyncIterator[object]):
 
     def __init__(self, execution: Execution) -> None:
         self._execution: Final = execution
-        self._hidden_params = execution_metadata(MappingProxyType({}), ExecutionOrigin.RUST)
         self._done = False
 
     def __aiter__(self) -> Stream:
@@ -95,8 +90,7 @@ class Stream(AsyncIterator[object]):
             raise StopAsyncIteration
         try:
             step: Final = await _settle(self._execution, self._execution.resume_value(None))
-        except BaseException as error:
-            mark_execution_error(error, ExecutionOrigin.RUST)
+        except BaseException:
             self._finish()
             raise
         if isinstance(step, Yield):
@@ -122,7 +116,6 @@ class SyncStream(Iterator[object]):
 
     def __init__(self, execution: Execution) -> None:
         self._execution: Final = execution
-        self._hidden_params = execution_metadata(MappingProxyType({}), ExecutionOrigin.RUST)
         self._done = False
 
     def __iter__(self) -> SyncStream:
@@ -133,8 +126,7 @@ class SyncStream(Iterator[object]):
             raise StopIteration
         try:
             step: Final = _settled(self._execution.resume_value(None))
-        except BaseException as error:
-            mark_execution_error(error, ExecutionOrigin.RUST)
+        except BaseException:
             self._finish()
             raise
         if isinstance(step, Yield):
