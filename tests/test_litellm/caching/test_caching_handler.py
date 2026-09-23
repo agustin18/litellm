@@ -823,3 +823,24 @@ async def test_partial_embedding_cache_hit_sends_only_misses_and_keeps_input_ord
 
     assert len(embedder.provider_inputs) == 2, embedder.provider_inputs
     assert [item["embedding"] for item in repeat.data] == [[float(len(text))] for text in mixed_input]
+
+
+def test_cached_response_clears_native_execution_marker():
+    from litellm.litellm_core_utils.execution import ExecutionOrigin
+    from litellm.rust_bridge.response_metadata import get_execution, mark_rust_response
+    from litellm.types.utils import ModelResponse
+
+    logger = _build_logging_obj("acompletion", stream=False)
+    cached = mark_rust_response(ModelResponse(model=logger.model))
+    handler = LLMCachingHandler(original_function=MagicMock(), request_kwargs={}, start_time=datetime.now())
+    response = handler._convert_cached_result_to_model_response(
+        cached_result=cached,
+        call_type="acompletion",
+        kwargs={"model": logger.model},
+        logging_obj=logger,
+        model=logger.model,
+        args=(),
+    )
+    assert get_execution(response) is ExecutionOrigin.CACHE
+    assert response._hidden_params["additional_headers"] == {}
+    assert response.choices == cached.choices

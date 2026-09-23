@@ -254,6 +254,7 @@ from litellm.router_utils.routing_groups import (
     parse_routing_groups,
     validate_routing_strategy,
 )
+from litellm.rust_bridge.response_metadata import execution_metadata, get_execution, mark_execution_error
 from litellm.scheduler import FlowItem, Scheduler
 from litellm.types.llms.openai import (
     AllMessageValues,
@@ -632,13 +633,22 @@ class FallbackAwareAnthropicMessagesStream:
 
     def adopt_fallback_source(self, fallback_response: object) -> None:
         self._source_iterator = fallback_response
+        self._hidden_params = execution_metadata(self._hidden_params, get_execution(fallback_response))
         self.fallback_headers_adopted = True
 
     def __aiter__(self) -> "FallbackAwareAnthropicMessagesStream":
         return self
 
     async def __anext__(self) -> bytes:
-        return await self._async_generator.__anext__()
+        try:
+            chunk: Final = await self._async_generator.__anext__()
+            origin: Final = get_execution(self._source_iterator)
+            if get_execution(self) is not origin:
+                self._hidden_params = execution_metadata(self._hidden_params, origin)
+            return chunk
+        except Exception as error:
+            mark_execution_error(error, get_execution(self._source_iterator))
+            raise
 
     async def aclose(self) -> None:
         await self._async_generator.aclose()
@@ -658,13 +668,18 @@ class FallbackAwareAnthropicMessagesStream:
         existing_headers: Final = cast(  # cast-ok: additional_headers is always a dict[str, object] when present
             "dict[str, object]", self._hidden_params.get("additional_headers") or {}
         )
-        self._hidden_params = {  # mutable-ok: matches _hidden_params' existing dict[str, object] shape
-            **self._hidden_params,
-            **fallback_hidden_params,
-            "additional_headers": dict(  # mutable-ok: hidden params expect a writable header bag
-                replace_complexity_router_headers(existing_headers, fallback_headers)
+        self._hidden_params = execution_metadata(
+            MappingProxyType(
+                {
+                    **self._hidden_params,
+                    **fallback_hidden_params,
+                    "additional_headers": dict(  # mutable-ok: hidden params expect a writable header bag
+                        replace_complexity_router_headers(existing_headers, fallback_headers)
+                    ),
+                }
             ),
-        }
+            get_execution(self._source_iterator),
+        )
 
 
 class RoutingArgs(enum.Enum):
@@ -707,6 +722,7 @@ class FallbackAwareStreamWrapper(CustomStreamWrapper):
         counters, `model_id` and `api_base` cannot reach the proxy's response headers or
         its callbacks.
         """
+        self._hidden_params = execution_metadata(self._hidden_params, get_execution(fallback_response))
         self._response_headers = getattr(fallback_response, "_response_headers", None)
         fallback_hidden_params, fallback_headers = prepared_fallback_hidden_params
         if fallback_hidden_params:

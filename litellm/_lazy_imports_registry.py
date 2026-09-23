@@ -372,6 +372,7 @@ LLM_PROVIDER_LOGIC_NAMES: Final = (
 # Utils module names that support lazy loading via _lazy_import_utils_module
 # These are attributes accessed from litellm.utils module
 UTILS_MODULE_NAMES: Final = (
+    "get_execution",
     "encoding",
     "BaseVectorStore",
     "CredentialAccessor",
@@ -1281,6 +1282,7 @@ _LLM_CONFIGS_IMPORT_MAP: Final = {
 
 # Import map for utils module lazy imports
 _UTILS_MODULE_IMPORT_MAP: Final = {
+    "get_execution": ("litellm.rust_bridge.response_metadata", "get_execution"),
     "encoding": ("litellm.main", "encoding"),
     "BaseVectorStore": (
         "litellm.integrations.vector_store_integrations.base_vector_store",

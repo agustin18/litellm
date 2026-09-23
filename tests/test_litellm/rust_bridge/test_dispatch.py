@@ -4,11 +4,13 @@ from typing import Final
 
 import pytest
 
+from litellm.litellm_core_utils.execution import ExecutionOrigin
 from litellm.rust_bridge import configuration
 from litellm.rust_bridge.bindings import NativeBinding
 from litellm.rust_bridge.catalog import CacheRule, Delivery, Route, RouteContext, RouteRule, Rules, SecretManagerRule
 from litellm.rust_bridge.configuration import Rollout
 from litellm.rust_bridge.dispatch import PublicDispatch
+from litellm.rust_bridge.response_metadata import get_execution
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,7 +94,7 @@ def test_disabled_optional_rust_rule_forwards_before_projection() -> None:
     assert result is expected
 
 
-def test_native_stream_result_is_not_consumed_or_wrapped() -> None:
+def test_native_stream_preserves_items_and_exposes_execution() -> None:
     request: Final = Request(model="streaming-model")
     stream: Final[Iterator[int]] = iter((1, 2))
     rules: Final[Rules] = (
@@ -121,7 +123,8 @@ def test_native_stream_result_is_not_consumed_or_wrapped() -> None:
         native=lambda hook, value, args, kwargs: hook(value, args, kwargs),
         rules=rules,
     )
-    assert result is stream
+    assert tuple(result) == (1, 2)
+    assert get_execution(result) is ExecutionOrigin.RUST
 
 
 @pytest.mark.asyncio

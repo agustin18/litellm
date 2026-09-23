@@ -5,9 +5,11 @@ import pytest
 
 import litellm
 from litellm.integrations.custom_logger import CustomLogger
+from litellm.litellm_core_utils.execution import ExecutionOrigin
 from litellm.rust_bridge import catalog
 from litellm.rust_bridge.catalog import Route, RouteRule
 from litellm.rust_bridge.configuration import Rollout
+from litellm.rust_bridge.response_metadata import get_execution
 from tests.test_litellm_rust.support.callback_recorder import RecordingLogger, drain_logging
 from tests.test_litellm_rust.support.isolation import rebound
 from tests.test_litellm_rust.support.recording_server import RecordingServer, ResponseSpec
@@ -64,6 +66,7 @@ async def test_native_messages_callbacks_see_the_provider_request_and_the_public
 
     assert_served_natively(messages_server)
     assert response["content"] == MESSAGES_RESPONSE["content"]
+    assert get_execution(response) is ExecutionOrigin.RUST
     sent: Final = messages_server.requests[0]
     assert sent.path == "/v1/messages"
     assert sent.body == {"model": "claude-sonnet-5", "messages": list(MESSAGES), "max_tokens": 64, "stream": False}
@@ -109,6 +112,7 @@ async def test_native_messages_provider_error_reaches_caller_and_failure_callbac
     assert_served_natively(messages_server)
     assert [phase for phase, _ in observed] == ["sync", "async"]
     assert all(error is raised.value for _, error in observed)
+    assert get_execution(raised.value) is ExecutionOrigin.RUST
 
 
 def sse_payload() -> bytes:
@@ -126,6 +130,7 @@ async def test_native_messages_stream_relays_provider_events_and_logs_success_on
         **arguments(messages_server, stream=True, callbacks=[recorder])
     )
     assert isinstance(stream, AsyncIterator)
+    assert get_execution(stream) is ExecutionOrigin.RUST
     first: Final = await anext(stream)
     await drain_logging()
     assert "async_log_success_event" not in recorder.names
@@ -152,6 +157,7 @@ async def test_native_messages_stream_closed_early_logs_success_once_for_what_wa
         **arguments(messages_server, stream=True, callbacks=[recorder])
     )
     assert isinstance(stream, AsyncIterator)
+    assert get_execution(stream) is ExecutionOrigin.RUST
     await anext(stream)
     await stream.aclose()
 
@@ -169,6 +175,7 @@ def test_native_sync_messages_stream_relays_provider_events_and_logs_success_onc
 
     stream: Final = litellm.anthropic.messages.create(**arguments(messages_server, stream=True, callbacks=[recorder]))
     assert isinstance(stream, Iterator)
+    assert get_execution(stream) is ExecutionOrigin.RUST
 
     assert b"".join(stream) == sse_payload()
     assert_served_natively(messages_server)
@@ -182,4 +189,5 @@ def test_native_sync_messages_returns_the_provider_message(messages_server: Reco
 
     assert_served_natively(messages_server)
     assert response["content"] == MESSAGES_RESPONSE["content"]
+    assert get_execution(response) is ExecutionOrigin.RUST
     assert len(recorder.wait_for("log_success_event")) == 1

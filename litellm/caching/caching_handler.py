@@ -995,7 +995,10 @@ class LLMCachingHandler:
             start_time=self.start_time,
             end_time=datetime.datetime.now(),
         )
-        return cached_result
+        from litellm.litellm_core_utils.execution import ExecutionOrigin, ExecutionResult
+        from litellm.rust_bridge.response_metadata import expose_result
+
+        return expose_result(ExecutionResult(cached_result, ExecutionOrigin.CACHE))
 
     def _convert_cached_stream_response(
         self,

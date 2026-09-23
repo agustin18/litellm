@@ -101,6 +101,9 @@ def finalize(
         MetadataUpdater, response_metadata.update_response_metadata
     )
     update(response, logger, model if isinstance(model, str) else None, kwargs, start_time, end_time)
+    from litellm.rust_bridge.response_metadata import mark_rust_response
+
+    mark_rust_response(response)
 
 
 class LoggingSurface(Protocol):
@@ -248,7 +251,10 @@ def failure_handler(
     logger: LoggingSurface, error: Exception, start: datetime.datetime, end: datetime.datetime, asynchronous: bool
 ) -> Coroutine[object, object, None] | None:
     from litellm.litellm_core_utils.core_helpers import unbind_budget_reservation_from_callbacks
+    from litellm.litellm_core_utils.execution import ExecutionOrigin
+    from litellm.rust_bridge.response_metadata import mark_execution_error
 
+    mark_execution_error(error, ExecutionOrigin.RUST)
     trace: Final = "".join(traceback.format_exception(error))
     if asynchronous:
         if not is_internal_call():

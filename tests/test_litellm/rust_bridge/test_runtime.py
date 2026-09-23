@@ -7,11 +7,13 @@ from typing import Final, Protocol
 import pytest
 
 from litellm.exceptions import APIError
+from litellm.litellm_core_utils.execution import EXECUTION_KEY, ExecutionOrigin
 from litellm.llms.base_llm.ocr.transformation import OCRResponse
 from litellm.router_utils.add_retry_fallback_headers import get_hidden_params_dict
 from litellm.rust_bridge import bindings, configuration, runtime
 from litellm.rust_bridge.catalog import Delivery, Route, RouteContext, RouteRule
 from litellm.rust_bridge.configuration import Rollout
+from litellm.rust_bridge.response_metadata import get_execution
 
 
 class RustBridgeDeclined(Exception):
@@ -75,13 +77,13 @@ def recorder(native_effect: BaseException | None = None) -> Recorder:
 
 
 def run(rollout: Rollout, calls: Recorder, *, native_missing: bool = False, context: RouteContext = CONTEXT) -> str:
-    return runtime.run(
+    return runtime.run_result(
         context,
         binding=binding(None if native_missing else calls.rust),
         native=lambda fn: fn(),
         python=calls.python,
         rules=rules(rollout),
-    )
+    ).value
 
 
 @pytest.mark.parametrize(
@@ -225,7 +227,7 @@ async def test_python_fallback_does_not_claim_rust_execution(missing: bool) -> N
         await runtime.arun(CONTEXT, binding=bound, native=anative, python=python, rules=rules(Rollout.RUST_OPT_OUT))
         is expected
     )
-    assert get_hidden_params_dict(expected) == {}
+    assert get_hidden_params_dict(expected) == {EXECUTION_KEY: ExecutionOrigin.PYTHON, "additional_headers": {}}
 
 
 @pytest.mark.asyncio
@@ -259,6 +261,7 @@ async def test_native_response_marker_reaches_caller_with_existing_metadata(shap
     )
     assert result is response
     assert get_hidden_params_dict(result) == {
+        EXECUTION_KEY: ExecutionOrigin.RUST,
         "response_cost": 0.01,
         "additional_headers": {"x-request-id": "upstream", "x-litellm-rust": "true"},
     }
@@ -271,6 +274,7 @@ def test_upstream_error_maps_to_api_error_without_fallback() -> None:
         run(Rollout.RUST_OPT_OUT, calls)
 
     assert caught.value.status_code == 429
+    assert get_execution(caught.value) is ExecutionOrigin.RUST
     assert calls.calls == (RUST,)
 
 
@@ -282,6 +286,7 @@ def test_other_native_errors_propagate_without_fallback() -> None:
         run(Rollout.RUST_OPT_OUT, calls)
 
     assert caught.value is failure
+    assert get_execution(caught.value) is ExecutionOrigin.RUST
     assert calls.calls == (RUST,)
 
 
@@ -323,7 +328,7 @@ async def test_arun_mirrors_sync_fallback(
     async def python() -> str:
         return calls.python()
 
-    result: Final = await runtime.arun(
+    result: Final = await runtime.arun_result(
         CONTEXT,
         binding=binding(None if native_missing else calls.rust),
         native=native,
@@ -331,7 +336,7 @@ async def test_arun_mirrors_sync_fallback(
         rules=rules(Rollout.RUST_OPT_OUT),
     )
 
-    assert result == expected[-1]
+    assert result.value == expected[-1]
     assert calls.calls == expected
 
 

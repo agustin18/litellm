@@ -68,41 +68,41 @@ def _python_encoding(name: str) -> tiktoken.Encoding:
 
 
 def get_encoding(name: str) -> Encoding:
-    return runtime.run(
+    return runtime.run_result(
         TIKTOKEN_CONTEXT,
         binding=TOKENIZER,
         native=lambda factory: _native_encoding(factory, name),
         python=lambda: _python_encoding(name),
-    )
+    ).value
 
 
 def anthropic() -> HuggingFace:
     """The packaged Anthropic tokenizer on the selected backend."""
     from litellm.utils import claude_json_str
 
-    return runtime.run(
+    return runtime.run_result(
         HUGGINGFACE_CONTEXT,
         binding=TOKENIZER,
         native=lambda factory: HuggingFaceTokenizer(_native_anthropic(factory)),
         python=lambda: PythonHuggingFaceTokenizer.from_str(claude_json_str),
-    )
+    ).value
 
 
 def from_str(json: str) -> HuggingFace:
-    return runtime.run(
+    return runtime.run_result(
         HUGGINGFACE_CONTEXT,
         binding=TOKENIZER,
         native=lambda factory: HuggingFaceTokenizer(factory.from_json(json)),
         python=lambda: PythonHuggingFaceTokenizer.from_str(json),
-    )
+    ).value
 
 
 def from_pretrained(identifier: str, revision: str = "main", token: str | None = None) -> HuggingFace:
-    return runtime.run(
+    return runtime.run_result(
         HUGGINGFACE_CONTEXT,
         binding=TOKENIZER,
         native=lambda factory: HuggingFaceTokenizer(
             factory.from_pretrained(identifier, revision=revision, token=token)
         ),
         python=lambda: PythonHuggingFaceTokenizer.from_pretrained(identifier, revision=revision, token=token),
-    )
+    ).value

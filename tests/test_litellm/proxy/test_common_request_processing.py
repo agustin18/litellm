@@ -9858,3 +9858,116 @@ class TestErrorLogCarriesCallId:
         record: Final = caplog.records[-1]
         assert record.litellm_call_id == call_id
         assert call_id in record.getMessage()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native", (False, True))
+async def test_execution_header_survives_payload_replacement_and_header_callback(
+    monkeypatch: pytest.MonkeyPatch, native: bool
+) -> None:
+    from litellm.litellm_core_utils.execution import ExecutionOrigin, ExecutionResult
+    from litellm.rust_bridge.response_metadata import expose_result
+
+    origin: Final = ExecutionOrigin.RUST if native else ExecutionOrigin.PYTHON
+    original: Final = expose_result(ExecutionResult({"text": "original"}, origin))
+    logger: Final = MagicMock()
+    logger.litellm_call_id = "execution-header"
+    logger._defer_async_logging = False
+    logger._on_deferred_stream_complete = None
+    logger.cost_breakdown = None
+    logger.litellm_params = {}
+    processor: Final = ProxyBaseLLMRequestProcessing(data={"model": "test-model", "litellm_logging_obj": logger})
+    callbacks: Final = MagicMock(spec=ProxyLogging)
+    callbacks.during_call_hook = AsyncMock(return_value=None)
+    callbacks.update_request_status = AsyncMock(return_value=None)
+    callbacks.post_call_success_hook = AsyncMock(return_value={"text": "modified"})
+    callbacks.post_call_response_headers_hook = AsyncMock(return_value={"X-LiteLLM-Rust": "forged", "x-hook": "kept"})
+
+    async def call() -> object:
+        return original
+
+    async def route(**kwargs: object) -> object:
+        return call()
+
+    monkeypatch.setattr(litellm.proxy.common_request_processing, "route_request", route)
+    http_response: Final = Response()
+    response: Final = await processor.base_process_llm_request(
+        request=Request(scope={"type": "http", "headers": []}),
+        fastapi_response=http_response,
+        user_api_key_dict=ProxyUserAPIKeyAuth(api_key="test-key"),
+        route_type="aocr",
+        proxy_logging_obj=callbacks,
+        general_settings={},
+        proxy_config=MagicMock(spec=ProxyConfig),
+        skip_pre_call_logic=True,
+    )
+    assert response == {"text": "modified"}
+    assert http_response.headers.get("x-litellm-rust") == ("true" if native else None)
+    assert http_response.headers["x-hook"] == "kept"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native", (False, True))
+async def test_execution_error_header_survives_error_replacement_and_callback(native: bool) -> None:
+    from litellm.litellm_core_utils.execution import ExecutionOrigin
+    from litellm.proxy._types import ProxyException
+    from litellm.rust_bridge.response_metadata import mark_execution_error
+
+    original: Final = ValueError("original")
+    mark_execution_error(original, ExecutionOrigin.RUST if native else ExecutionOrigin.PYTHON)
+    callbacks: Final = MagicMock(spec=ProxyLogging)
+    callbacks.post_call_failure_hook = AsyncMock(return_value=HTTPException(status_code=429, detail="replaced"))
+    callbacks.post_call_response_headers_hook = AsyncMock(return_value={"X-LiteLLM-Rust": "forged"})
+    processor: Final = ProxyBaseLLMRequestProcessing(data={})
+    with pytest.raises(ProxyException) as caught:
+        await processor._handle_llm_api_exception(
+            e=original,
+            user_api_key_dict=ProxyUserAPIKeyAuth(api_key="test-key"),
+            proxy_logging_obj=callbacks,
+        )
+    assert caught.value.code == "429"
+    assert caught.value.headers.get("x-litellm-rust") == ("true" if native else None)
+    assert "X-LiteLLM-Rust" not in caught.value.headers
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("before_commit", (False, True))
+async def test_messages_stream_execution_header_is_frozen_at_http_commit(before_commit: bool) -> None:
+    from litellm.litellm_core_utils.execution import ExecutionOrigin, ExecutionResult, execution_headers
+    from litellm.router import FallbackAwareAnthropicMessagesStream
+    from litellm.rust_bridge.response_metadata import expose_result, get_execution
+
+    async def source() -> AsyncGenerator[bytes, None]:
+        yield b"event: message_stop\ndata: {}\n\n"
+
+    initial: Final = expose_result(ExecutionResult(source(), ExecutionOrigin.RUST))
+    fallback: Final = expose_result(ExecutionResult(source(), ExecutionOrigin.PYTHON))
+
+    async def selected() -> AsyncGenerator[bytes, None]:
+        if not before_commit:
+            yield b"event: ping\ndata: {}\n\n"
+        stream.adopt_fallback_source(fallback)
+        async for chunk in fallback:
+            yield chunk
+
+    stream: Final = FallbackAwareAnthropicMessagesStream(selected(), initial)
+
+    async def body() -> AsyncGenerator[str, None]:
+        async for chunk in stream:
+            yield chunk.decode()
+
+    async def headers() -> dict[str, str]:
+        return dict(execution_headers({"X-LiteLLM-Rust": "forged"}, get_execution(stream)))
+
+    response: Final = await create_response(body(), "text/event-stream", await headers(), refresh_headers=headers)
+    assert isinstance(response, StreamingResponse)
+    assert response.headers.get("x-litellm-rust") == (None if before_commit else "true")
+    delivered: Final = tuple([chunk async for chunk in response.body_iterator])
+    assert delivered == (
+        ("event: message_stop\ndata: {}\n\n",)
+        if before_commit
+        else ("event: ping\ndata: {}\n\n", "event: message_stop\ndata: {}\n\n")
+    )
+    assert get_execution(stream) is ExecutionOrigin.PYTHON
+    assert response.headers.get("x-litellm-rust") == (None if before_commit else "true")
+    await initial.aclose()

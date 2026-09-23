@@ -7,10 +7,11 @@ from typing import Final, Generic, NoReturn, TypeAlias, TypeVar
 from typing_extensions import assert_never
 
 from litellm.exceptions import APIError
+from litellm.litellm_core_utils.execution import ExecutionOrigin, ExecutionResult
 from litellm.rust_bridge.bindings import NativeBinding, native_exception_types
 from litellm.rust_bridge.catalog import RouteContext, Rules, decision
 from litellm.rust_bridge.configuration import Decision
-from litellm.rust_bridge.response_metadata import mark_rust_response
+from litellm.rust_bridge.response_metadata import expose_result, mark_execution_error
 
 NativeT = TypeVar("NativeT")
 ResultT = TypeVar("ResultT")
@@ -49,24 +50,7 @@ def run(
     python: Callable[[], ResultT],
     rules: Rules | None = None,
 ) -> ResultT:
-    selected: Final = decision(context, rules)
-    match selected:
-        case Decision.PYTHON:
-            return python()
-        case Decision.RUST_WITH_FALLBACK | Decision.RUST_REQUIRED:
-            loaded: Final = binding.load()
-            result: Final = attempt(
-                native_call=None if loaded is None else lambda: native(loaded),
-                adapt=_identity,
-                context=_error_context(context),
-            )
-            if isinstance(result, RustHandled):
-                return mark_rust_response(result.value)
-            if selected is Decision.RUST_REQUIRED:
-                _raise_required(result, _error_context(context))
-            return python()
-        case _:
-            assert_never(selected)
+    return expose_result(run_result(context, binding=binding, native=native, python=python, rules=rules))
 
 
 async def arun(
@@ -77,10 +61,49 @@ async def arun(
     python: Callable[[], Awaitable[ResultT]],
     rules: Rules | None = None,
 ) -> ResultT:
+    return expose_result(await arun_result(context, binding=binding, native=native, python=python, rules=rules))
+
+
+def run_result(
+    context: RouteContext,
+    *,
+    binding: NativeBinding[NativeT],
+    native: Callable[[NativeT], ResultT],
+    python: Callable[[], ResultT],
+    rules: Rules | None = None,
+) -> ExecutionResult[ResultT]:
     selected: Final = decision(context, rules)
     match selected:
         case Decision.PYTHON:
-            return await python()
+            return _python_result(python)
+        case Decision.RUST_WITH_FALLBACK | Decision.RUST_REQUIRED:
+            loaded: Final = binding.load()
+            result: Final = attempt(
+                native_call=None if loaded is None else lambda: native(loaded),
+                adapt=_identity,
+                context=_error_context(context),
+            )
+            if isinstance(result, RustHandled):
+                return ExecutionResult(result.value, ExecutionOrigin.RUST)
+            if selected is Decision.RUST_REQUIRED:
+                _raise_required(result, _error_context(context))
+            return _python_result(python)
+        case _:
+            assert_never(selected)
+
+
+async def arun_result(
+    context: RouteContext,
+    *,
+    binding: NativeBinding[NativeT],
+    native: Callable[[NativeT], Awaitable[ResultT]],
+    python: Callable[[], Awaitable[ResultT]],
+    rules: Rules | None = None,
+) -> ExecutionResult[ResultT]:
+    selected: Final = decision(context, rules)
+    match selected:
+        case Decision.PYTHON:
+            return await _apython_result(python)
         case Decision.RUST_WITH_FALLBACK | Decision.RUST_REQUIRED:
             loaded: Final = binding.load()
             result: Final = await aattempt(
@@ -89,12 +112,28 @@ async def arun(
                 context=_error_context(context),
             )
             if isinstance(result, RustHandled):
-                return mark_rust_response(result.value)
+                return ExecutionResult(result.value, ExecutionOrigin.RUST)
             if selected is Decision.RUST_REQUIRED:
                 _raise_required(result, _error_context(context))
-            return await python()
+            return await _apython_result(python)
         case _:
             assert_never(selected)
+
+
+def _python_result(call: Callable[[], ResultT]) -> ExecutionResult[ResultT]:
+    try:
+        return ExecutionResult(call(), ExecutionOrigin.PYTHON)
+    except BaseException as error:
+        mark_execution_error(error, ExecutionOrigin.PYTHON)
+        raise
+
+
+async def _apython_result(call: Callable[[], Awaitable[ResultT]]) -> ExecutionResult[ResultT]:
+    try:
+        return ExecutionResult(await call(), ExecutionOrigin.PYTHON)
+    except BaseException as error:
+        mark_execution_error(error, ExecutionOrigin.PYTHON)
+        raise
 
 
 def _identity(value: ResultT) -> ResultT:
@@ -114,16 +153,21 @@ def attempt(
     if native_call is None:
         return RustUnavailable()
     exceptions: Final = native_exception_types()
-    if exceptions is None:
-        return RustHandled(adapt(native_call()))
-    declined, upstream = exceptions
+    declined, upstream = exceptions if exceptions is not None else ((), ())
     try:
         value: Final = native_call()
     except declined as error:
         return RustDeclined(reason=_decline_reason(error))
     except upstream as error:
         _raise_upstream(error, context)
-    return RustHandled(adapt(value))
+    except BaseException as error:
+        mark_execution_error(error, ExecutionOrigin.RUST)
+        raise
+    try:
+        return RustHandled(adapt(value))
+    except BaseException as error:
+        mark_execution_error(error, ExecutionOrigin.RUST)
+        raise
 
 
 async def aattempt(
@@ -135,16 +179,21 @@ async def aattempt(
     if native_call is None:
         return RustUnavailable()
     exceptions: Final = native_exception_types()
-    if exceptions is None:
-        return RustHandled(adapt(await native_call()))
-    declined, upstream = exceptions
+    declined, upstream = exceptions if exceptions is not None else ((), ())
     try:
         value: Final = await native_call()
     except declined as error:
         return RustDeclined(reason=_decline_reason(error))
     except upstream as error:
         _raise_upstream(error, context)
-    return RustHandled(adapt(value))
+    except BaseException as error:
+        mark_execution_error(error, ExecutionOrigin.RUST)
+        raise
+    try:
+        return RustHandled(adapt(value))
+    except BaseException as error:
+        mark_execution_error(error, ExecutionOrigin.RUST)
+        raise
 
 
 def _decline_reason(error: BaseException) -> str:
@@ -173,9 +222,11 @@ def _raise_upstream(error: BaseException, context: BridgeErrorContext) -> NoRetu
     message_value: Final = args[1] if len(args) > 1 else str(error)
     status: Final = status_value if isinstance(status_value, int) else 0
     message: Final = message_value if isinstance(message_value, str) else str(message_value)
-    raise APIError(
+    public_error: Final = APIError(
         status_code=status or 500,
         message=f"litellm rust {context.route}: {message}",
         llm_provider=context.provider,
         model=context.model,
-    ) from error
+    )
+    mark_execution_error(public_error, ExecutionOrigin.RUST)
+    raise public_error from error

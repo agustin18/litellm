@@ -59,6 +59,13 @@ from litellm.litellm_core_utils.core_helpers import (
     redact_nested_match_and_regex_keys,
 )
 from litellm.litellm_core_utils.dd_tracing import NullTracer, tracer
+from litellm.litellm_core_utils.execution import (
+    RUST_HEADER,
+    ExecutionOrigin,
+    ExecutionResult,
+    execution_from_metadata,
+    execution_headers,
+)
 from litellm.litellm_core_utils.get_supported_openai_params import (
     get_supported_openai_params,
 )
@@ -114,6 +121,7 @@ from litellm.proxy.utils import ProxyLogging, _check_and_merge_model_level_guard
 from litellm.router import Router
 from litellm.router_utils.add_retry_fallback_headers import get_hidden_params_dict
 from litellm.router_utils.common_utils import resolve_model_group_alias
+from litellm.rust_bridge.response_metadata import get_execution, mark_execution_error
 from litellm.types.guardrails import GuardrailEventHooks
 from litellm.types.router import RouterRateLimitError
 from litellm.types.router_weights import validate_router_weights
@@ -1830,7 +1838,14 @@ class ProxyBaseLLMRequestProcessing:
                 headers.update(logging_caching_headers)
 
         try:
-            return {key: str(value) for key, value in headers.items() if value not in exclude_values}
+            return dict(  # mutable-ok: callers add their endpoint headers
+                execution_headers(
+                    MappingProxyType(
+                        {key: str(value) for key, value in headers.items() if value not in exclude_values}
+                    ),
+                    execution_from_metadata(hidden_params),
+                )
+            )
         except Exception as e:
             verbose_proxy_logger.error("Error setting custom headers: %s", e)
             return {}
@@ -1857,6 +1872,7 @@ class ProxyBaseLLMRequestProcessing:
         if not isinstance(hidden_params, dict):
             hidden_params = {}
 
+        execution_origin: Final = get_execution(response)
         model_id: Final = ProxyBaseLLMRequestProcessing._get_model_id_from_response(hidden_params, request_data)
 
         cache_key: Final = hidden_params.get("cache_key", None) or ""
@@ -1890,7 +1906,9 @@ class ProxyBaseLLMRequestProcessing:
         if callback_headers:
             custom_headers.update(callback_headers)
 
-        return custom_headers
+        return dict(  # mutable-ok: endpoint callers update response headers
+            execution_headers(custom_headers, execution_origin)
+        )
 
     async def common_processing_pre_call_logic(
         self,
@@ -2346,31 +2364,35 @@ class ProxyBaseLLMRequestProcessing:
         self,
         *,
         hidden_params: Mapping[str, object],
+        execution_origin: ExecutionOrigin,
         user_api_key_dict: UserAPIKeyAuth,
         logging_obj: LiteLLMLoggingObj,
         version: str | None,
         callback_headers: Mapping[str, str],
     ) -> Mapping[str, str]:
         """The streaming response headers describing `hidden_params`' deployment."""
-        return MappingProxyType(
-            {
-                **ProxyBaseLLMRequestProcessing.get_custom_headers(
-                    user_api_key_dict=user_api_key_dict,
-                    call_id=logging_obj.litellm_call_id,
-                    model_id=self._get_model_id_from_response(hidden_params, self.data),
-                    cache_key=hidden_params.get("cache_key") or "",
-                    api_base=hidden_params.get("api_base") or "",
-                    version=version,
-                    response_cost=hidden_params.get("response_cost") or "",
-                    model_region=getattr(user_api_key_dict, "allowed_model_region", ""),
-                    fastest_response_batch_completion=hidden_params.get("fastest_response_batch_completion"),
-                    request_data=self.data,
-                    hidden_params=hidden_params,
-                    litellm_logging_obj=logging_obj,
-                    **(hidden_params.get("additional_headers") or MappingProxyType({})),
-                ),
-                **callback_headers,
-            }
+        return execution_headers(
+            MappingProxyType(
+                {
+                    **ProxyBaseLLMRequestProcessing.get_custom_headers(
+                        user_api_key_dict=user_api_key_dict,
+                        call_id=logging_obj.litellm_call_id,
+                        model_id=self._get_model_id_from_response(hidden_params, self.data),
+                        cache_key=hidden_params.get("cache_key") or "",
+                        api_base=hidden_params.get("api_base") or "",
+                        version=version,
+                        response_cost=hidden_params.get("response_cost") or "",
+                        model_region=getattr(user_api_key_dict, "allowed_model_region", ""),
+                        fastest_response_batch_completion=hidden_params.get("fastest_response_batch_completion"),
+                        request_data=self.data,
+                        hidden_params=hidden_params,
+                        litellm_logging_obj=logging_obj,
+                        **(hidden_params.get("additional_headers") or MappingProxyType({})),
+                    ),
+                    **callback_headers,
+                }
+            ),
+            execution_origin,
         )
 
     @staticmethod
@@ -2611,6 +2633,7 @@ class ProxyBaseLLMRequestProcessing:
             await _cancel_pending_gather_tasks(tasks)
 
         response = responses[1]
+        execution_result: Final = ExecutionResult(response, get_execution(response))
 
         _exception_raised = False
         try:
@@ -2649,6 +2672,7 @@ class ProxyBaseLLMRequestProcessing:
                 )
                 custom_headers: Final = self._stream_response_headers(
                     hidden_params=hidden_params,
+                    execution_origin=execution_result.origin,
                     user_api_key_dict=user_api_key_dict,
                     logging_obj=logging_obj,
                     version=version,
@@ -2658,6 +2682,11 @@ class ProxyBaseLLMRequestProcessing:
                 async def refresh_stream_headers() -> Mapping[str, str]:
                     """`custom_headers` rebuilt for whichever deployment served the stream."""
                     return self._stream_response_headers(
+                        execution_origin=(
+                            get_execution(response)
+                            if getattr(response, "fallback_headers_adopted", False)
+                            else execution_result.origin
+                        ),
                         hidden_params=(
                             get_hidden_params_dict(response)
                             if getattr(response, "fallback_headers_adopted", False)
@@ -2728,7 +2757,7 @@ class ProxyBaseLLMRequestProcessing:
                             content=generator,  # pyright: ignore[reportArgumentType]  # generator-configured StreamingResponse
                             status_code=getattr(response, "status_code", status.HTTP_200_OK),
                             media_type=self._passthrough_event_stream_media_type(),
-                            headers=streaming_headers,
+                            headers=execution_headers(streaming_headers, execution_result.origin),
                         )
                     else:
                         _early = await self._handle_non_streaming_allm_passthrough_route(
@@ -2743,7 +2772,7 @@ class ProxyBaseLLMRequestProcessing:
                         return StreamingResponse(
                             content=response.aiter_bytes(),
                             status_code=response.status_code,
-                            headers=streaming_headers,
+                            headers=execution_headers(streaming_headers, execution_result.origin),
                         )
                 elif route_type == "anthropic_messages":
                     # Check if response is actually a streaming response (async generator)
@@ -2845,7 +2874,8 @@ class ProxyBaseLLMRequestProcessing:
                 response=response,
             )
             record_served_output_texts(logging_obj.model_call_details, served_output_texts(response))
-        except Exception:
+        except Exception as error:
+            mark_execution_error(error, execution_result.origin)
             _exception_raised = True
             raise
         finally:
@@ -2949,6 +2979,10 @@ class ProxyBaseLLMRequestProcessing:
         )
         if callback_headers:
             fastapi_response.headers.update(callback_headers)
+
+        if RUST_HEADER in fastapi_response.headers:
+            del fastapi_response.headers[RUST_HEADER]
+        fastapi_response.headers.update(execution_headers(MappingProxyType({}), execution_result.origin))
 
         await check_response_size_is_safe(response=response)
 
@@ -3275,6 +3309,7 @@ class ProxyBaseLLMRequestProcessing:
             HttpPassThroughEndpointHelpers,
         )
 
+        execution_origin: Final = get_execution(response)
         upstream: Final = _as_upstream_response(response)
         try:
             response_status: Final[int] = upstream.status_code
@@ -3315,7 +3350,7 @@ class ProxyBaseLLMRequestProcessing:
                 content=modified_bytes,
                 status_code=response_status,
                 media_type=content_type,
-                headers=response_headers,
+                headers=execution_headers(response_headers, execution_origin),
             )
 
         body_bytes = await upstream.aread()
@@ -3326,7 +3361,7 @@ class ProxyBaseLLMRequestProcessing:
                 content=body_bytes,
                 status_code=response_status,
                 media_type="application/json",
-                headers=response_headers,
+                headers=execution_headers(response_headers, execution_origin),
             )
         processed: Final = await proxy_logging_obj.post_call_success_hook(
             data=self.data,
@@ -3345,7 +3380,7 @@ class ProxyBaseLLMRequestProcessing:
             content=content,
             status_code=response_status,
             media_type="application/json",
-            headers=response_headers,
+            headers=execution_headers(response_headers, execution_origin),
         )
 
     async def _handle_event_stream_allm_passthrough_route(
@@ -3615,6 +3650,7 @@ class ProxyBaseLLMRequestProcessing:
         """Raises ProxyException (OpenAI API compatible) if an exception is raised"""
         log_llm_api_exception(e, self.litellm_call_id)
         # Allow callbacks to transform the error response
+        execution_origin: Final = get_execution(e)
         transformed_exception: Final = await proxy_logging_obj.post_call_failure_hook(
             user_api_key_dict=user_api_key_dict,
             original_exception=e,
@@ -3676,13 +3712,22 @@ class ProxyBaseLLMRequestProcessing:
         except Exception:
             pass
 
-        safe_headers: Final = {k: v for k, v in headers.items() if k.lower() not in UNSAFE_PROXY_RESPONSE_HEADERS}
+        safe_headers: Final = dict(  # mutable-ok: cooldown handler adds retry-after
+            execution_headers(
+                MappingProxyType({k: v for k, v in headers.items() if k.lower() not in UNSAFE_PROXY_RESPONSE_HEADERS}),
+                execution_origin,
+            )
+        )
 
         self._apply_router_cooldown_retry_after(safe_headers, e)
 
         if isinstance(e, ProxyException):
             e.headers = {
-                **{k: v for k, v in e.headers.items() if k.lower() not in UNSAFE_PROXY_RESPONSE_HEADERS},
+                **{
+                    k: v
+                    for k, v in e.headers.items()
+                    if k.lower() not in UNSAFE_PROXY_RESPONSE_HEADERS and k.lower() != RUST_HEADER
+                },
                 **{k: v if isinstance(v, str) else str(v) for k, v in safe_headers.items()},
             }
             raise e
