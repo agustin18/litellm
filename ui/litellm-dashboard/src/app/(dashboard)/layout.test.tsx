@@ -6,11 +6,16 @@ import Layout from "./layout";
 const { replaceMock } = vi.hoisted(() => ({ replaceMock: vi.fn() }));
 
 let searchParamsValue = new URLSearchParams();
+let pathnameValue = "/ui/guardrails";
 
 vi.mock("next/navigation", () => ({
   useRouter: vi.fn(() => ({ push: vi.fn(), replace: replaceMock })),
   useSearchParams: vi.fn(() => searchParamsValue),
-  usePathname: vi.fn(() => "/ui/guardrails"),
+  usePathname: vi.fn(() => pathnameValue),
+}));
+
+vi.mock("@/components/liteadmin/LiteAdmin", () => ({
+  default: () => <button>LiteAdmin</button>,
 }));
 
 vi.mock("@/components/DashboardHeader", () => ({
@@ -79,7 +84,33 @@ describe("(dashboard) Layout", () => {
     vi.clearAllMocks();
     pendingUiConfig = createDeferred();
     searchParamsValue = new URLSearchParams();
+    pathnameValue = "/ui/guardrails";
   });
+
+  it.each(["/ui/playground", "/ui/playground/"])(
+    "hides LiteAdmin on %s and restores it after leaving Playground",
+    async (pathname) => {
+      const dashboard = () => (
+        <AuthProvider>
+          <Layout>
+            <div data-testid="page-content" />
+          </Layout>
+        </AuthProvider>
+      );
+      const { rerender } = render(dashboard());
+      pendingUiConfig.resolve();
+      expect(await screen.findByRole("button", { name: "LiteAdmin" })).toBeInTheDocument();
+
+      pathnameValue = pathname;
+      rerender(dashboard());
+      expect(screen.queryByRole("button", { name: "LiteAdmin" })).not.toBeInTheDocument();
+      expect(screen.getByTestId("page-content")).toBeInTheDocument();
+
+      pathnameValue = "/ui/api-keys";
+      rerender(dashboard());
+      expect(screen.getByRole("button", { name: "LiteAdmin" })).toBeInTheDocument();
+    },
+  );
 
   it("does not mount route content until getUiConfig has resolved", async () => {
     render(
