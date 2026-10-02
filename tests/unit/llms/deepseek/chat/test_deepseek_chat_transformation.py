@@ -158,6 +158,16 @@ class TestDeepSeekVisionMultimodalContent:
         assert result[0]["content"][1]["type"] == "image_url"
         assert result[0]["content"][1]["image_url"]["url"] == "https://example.com/image.jpg"
 
+    def test_tool_image_list_forwarded_on_vision_model(self):
+        tool_msg = self._image_message(role="tool")
+        tool_msg["tool_call_id"] = "call_abc123"
+        result = self.config._transform_messages([tool_msg], model=self.VISION_MODEL)
+
+        assert len(result) == 2
+        assert result[0]["role"] == "tool"
+        assert result[1]["role"] == "user"
+        assert any(isinstance(b, dict) and b.get("type") == "image_url" for b in result[1]["content"])
+
     def test_image_list_collapsed_on_non_vision_model(self):
         result = self.config._transform_messages([self._image_message()], model=self.NON_VISION_MODEL)
 
